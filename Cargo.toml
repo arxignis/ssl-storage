@@ -1,0 +1,35 @@
+[package]
+name = "ssl-storage"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "ssl_storage"
+path = "src/lib.rs"
+
+[dependencies]
+actix-web = "4"
+actix-files = "0.6"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "logging"] }
+rustls-pemfile = "2"
+instant-acme = "0.8"
+rcgen = "0.14"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+ureq = { version = "2", features = ["tls"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "fs", "net"] }
+async-trait = "0.1"
+base64 = "0.22"
+tracing-subscriber = "0.3"
+tokio-rustls = "0.26"
+pem = "3"
+trust-dns-resolver = "0.23"
+redis = { version = "0.32", features = ["tokio-native-tls-comp", "connection-manager"] }
+native-tls = "0.2"
+reqwest = { version = "0.12", features = ["json"] }
+

@@ -1,0 +1,66 @@
+# SSL Storage Configuration
+
+# Server settings
+server:
+  ip: "0.0.0.0"
+  port: 80
+
+# Certificate storage settings
+storage:
+  # Storage backend type: "file" or "redis"
+  type: "redis"
+  # Base path for certificate storage (used for file storage)
+  https_path: "certs"
+  # Redis URL (used for redis storage, can also be set via REDIS_URL env var)
+  redis_url: "redis://127.0.0.1:6379"
+  # Lock TTL in seconds (for Redis distributed lock, default: 900 = 15 minutes)
+  lock_ttl_seconds: 900
+  # Redis SSL/TLS configuration (optional)
+  # redis_ssl:
+  #   # Path to CA certificate file (PEM format)
+  #   ca_cert_path: "/path/to/ca-cert.pem"
+  #   # Path to client certificate file (PEM format, optional)
+  #   client_cert_path: "/path/to/client-cert.pem"
+  #   # Path to client private key file (PEM format, optional)
+  #   client_key_path: "/path/to/client-key.pem"
+  #   # Skip certificate verification (for testing with self-signed certs)
+  #   insecure: false
+
+# ACME/Let's Encrypt settings
+acme:
+  # Default email for Let's Encrypt registration
+  email: "example@example.com"
+  # Use staging server (for testing)
+  development: false
+  # DNS-01 challenge lookup settings
+  dns_lookup:
+    # Maximum number of attempts to check DNS record
+    max_attempts: 100
+    # Delay between attempts in seconds
+    delay_seconds: 10
+
+# Domain source configuration
+domains:
+  # Source type: "file", "redis", or "http"
+  source: "redis"
+  # File path (for file source)
+  file_path: "domains.json"
+  # Redis key (for redis source)
+  redis_key: "ssl-storage:domains"
+  # Redis URL (for redis source, can also be set via REDIS_URL env var)
+  redis_url: "redis://127.0.0.1:6379"
+  # Redis SSL/TLS configuration (optional, for redis source)
+  # redis_ssl:
+  #   # Path to CA certificate file (PEM format)
+  #   ca_cert_path: "/path/to/ca-cert.pem"
+  #   # Path to client certificate file (PEM format, optional)
+  #   client_cert_path: "/path/to/client-cert.pem"
+  #   # Path to client private key file (PEM format, optional)
+  #   client_key_path: "/path/to/client-key.pem"
+  #   # Skip certificate verification (for testing with self-signed certs)
+  #   insecure: false
+  # HTTP endpoint (for http source)
+  http_url: "http://localhost:8080/domains"
+  # HTTP refresh interval in seconds (for http source)
+  http_refresh_interval: 300
+

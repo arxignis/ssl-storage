@@ -1,0 +1,15 @@
+[
+  {
+    "domain": "arxignis.com",
+    "email": "oss@arxignis.com",
+    "dns": true,
+    "wildcard": true
+  },
+  {
+    "domain": "playground.arxignis.example",
+    "email": "oss@arxignis.com",
+    "dns": false,
+    "wildcard": false
+  }
+]
+
