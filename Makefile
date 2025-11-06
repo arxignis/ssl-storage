@@ -14,7 +14,7 @@ release:
 	@sed -i.bak 's/^VERSION=.*$$/VERSION=$(VERSION)/' install.sh && rm install.sh.bak
 	@sed -i.bak 's/^version = ".*"/version = "$(VERSION)"/' Cargo.toml && rm Cargo.toml.bak
 	@cargo update -p ssl-storage
-	@git add Cargo.toml Cargo.lock
+	@git add Cargo.toml Cargo.lock install.sh
 	@git commit -m "chore: release ssl-storage $(VERSION)"
 	@git tag v$(VERSION)
 	@git push origin main
