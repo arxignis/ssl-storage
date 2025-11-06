@@ -440,9 +440,10 @@ async fn cert_init_server(
     std::thread::sleep(std::time::Duration::from_secs(2));
     info!("Testing availability of {}", &well_known_url);
 
-    let agent = ureq::builder()
-        .timeout(std::time::Duration::from_secs(2))
+    let config = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(2)))
         .build();
+    let agent: ureq::Agent = config.into();
     let resp = agent
         .get(&well_known_url)
         // .get("https://docs.certifytheweb.com/docs/http-validation/")
