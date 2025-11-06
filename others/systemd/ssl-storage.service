@@ -1,0 +1,56 @@
+# Systemd service file for SSL storage
+# Installation:
+#   1. Copy this file to /etc/systemd/system/ssl-storage.service
+#   2. Update paths and configuration as needed
+#   3. Run: systemctl daemon-reload
+#   4. Run: systemctl enable ssl-storage
+#   5. Run: systemctl start ssl-storage
+
+[Unit]
+Description=SSL storage - Distributed SSL storage
+Documentation=https://github.com/arxignis/ssl-storage
+After=network-online.target redis.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/ssl-storage.pid
+
+# Paths
+ExecStart=/usr/local/bin/ssl-storage --daemon --config /etc/ssl-storage/config.yaml
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStop=/bin/kill -TERM $MAINPID
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+# Environment
+Environment="RUST_LOG=info"
+
+# Working directory
+WorkingDirectory=/var/lib/ssl-storage
+
+# Security settings
+# Note: Some of these may need adjustment depending on your requirements
+NoNewPrivileges=true
+PrivateTmp=true
+
+# File system access
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/ssl-storage /var/run /var/lib/ssl-storage
+
+# Network
+PrivateNetwork=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ssl-storage
+
+[Install]
+WantedBy=multi-user.target
+
