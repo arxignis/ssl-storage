@@ -33,12 +33,64 @@ pub struct AppConfig {
     pub storage: StorageConfig,
     pub acme: AcmeConfig,
     pub domains: crate::domain_reader::DomainSourceConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     pub ip: String,
     pub port: u16,
+    /// Run as daemon (background process)
+    #[serde(default)]
+    pub daemon: bool,
+    /// PID file path (for daemon mode)
+    pub pid_file: Option<String>,
+    /// Working directory for daemon
+    pub working_directory: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingConfig {
+    /// Logging output: "stdout", "syslog", or "journald"
+    #[serde(default = "default_log_output")]
+    pub output: String,
+    /// Log level: trace, debug, info, warn, error
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    /// Syslog facility (for syslog output)
+    #[serde(default = "default_syslog_facility")]
+    pub syslog_facility: String,
+    /// Syslog identifier/tag (for syslog output)
+    #[serde(default = "default_syslog_identifier")]
+    pub syslog_identifier: String,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            output: default_log_output(),
+            level: default_log_level(),
+            syslog_facility: default_syslog_facility(),
+            syslog_identifier: default_syslog_identifier(),
+        }
+    }
+}
+
+fn default_log_output() -> String {
+    "stdout".to_string()
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+fn default_syslog_facility() -> String {
+    "daemon".to_string()
+}
+
+fn default_syslog_identifier() -> String {
+    "ssl-storage".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

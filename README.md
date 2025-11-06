@@ -20,6 +20,7 @@ A Rust-based ACME/Let's Encrypt certificate management tool with support for mul
 - **Automatic Renewal**: Checks certificate expiration and automatically renews when needed
 - **REST API**: HTTP endpoints for checking certificate expiration status
 - **DNS Propagation Checking**: Automatically verifies DNS TXT records for DNS-01 challenges
+- **Flexible Logging**: Support for stdout, syslog, and journald with configurable log levels
 
 ## Installation
 
@@ -49,6 +50,21 @@ Create a `config.yaml` file in the project root:
 server:
   ip: "0.0.0.0"
   port: 80
+  # Run as daemon (background process)
+  daemon: false
+  # PID file path (for daemon mode)
+  pid_file: "/var/run/ssl-storage.pid"
+
+# Logging settings
+logging:
+  # Logging output: "stdout", "syslog", or "journald"
+  output: "stdout"
+  # Log level: trace, debug, info, warn, error
+  level: "info"
+  # Syslog facility (for syslog output): daemon, user, local0-local7, etc.
+  syslog_facility: "daemon"
+  # Syslog identifier/tag (for syslog output)
+  syslog_identifier: "ssl-storage"
 
 # Certificate storage settings
 storage:
@@ -304,9 +320,140 @@ Serves HTTP-01 challenge tokens for Let's Encrypt validation.
 - The application automatically checks DNS propagation before proceeding
 - DNS challenge data is stored in Redis (when using Redis storage) for reference
 
+## Daemon Mode
+
+The application can run as a background daemon process:
+
+```yaml
+server:
+  daemon: true
+  pid_file: "/var/run/ssl-storage.pid"
+  working_directory: "/var/lib/ssl-storage"  # Optional
+```
+
+**Important notes for daemon mode:**
+- When running as daemon, use `syslog` or `journald` for logging (stdout won't be visible)
+- The PID file allows you to manage the daemon process
+- Ensure the user has write permissions to the PID file location
+- The process will fork to background and detach from the terminal
+
+**Managing the daemon:**
+
+```bash
+# Start as daemon
+ssl-storage --config config.yaml
+
+# Check if running
+cat /var/run/ssl-storage.pid
+ps aux | grep ssl-storage
+
+# Stop the daemon
+kill $(cat /var/run/ssl-storage.pid)
+
+# View logs (if using syslog)
+tail -f /var/log/syslog | grep ssl-storage
+```
+
+**Example daemon configuration:**
+
+```yaml
+server:
+  ip: "0.0.0.0"
+  port: 80
+  daemon: true
+  pid_file: "/var/run/ssl-storage.pid"
+
+logging:
+  output: "syslog"
+  level: "info"
+  syslog_facility: "daemon"
+  syslog_identifier: "ssl-storage"
+```
+
+For production deployments, consider using systemd instead (see Logging section below).
+
+## Logging
+
+The application supports three logging outputs:
+
+### Stdout (Default)
+
+Logs to standard output/error. Suitable for Docker containers and development.
+
+```yaml
+logging:
+  output: "stdout"
+  level: "info"
+```
+
+### Syslog
+
+Logs to the system syslog daemon. Ideal for production servers.
+
+```yaml
+logging:
+  output: "syslog"
+  level: "info"
+  syslog_facility: "daemon"
+  syslog_identifier: "ssl-storage"
+```
+
+**Available syslog facilities:**
+- `daemon` - System daemons (recommended)
+- `user` - User-level messages
+- `local0` through `local7` - Custom local use
+- `auth`, `authpriv`, `cron`, `ftp`, `kern`, `lpr`, `mail`, `news`, `syslog`, `uucp`
+
+**View syslog messages:**
+```bash
+# On most Linux systems
+tail -f /var/log/syslog | grep ssl-storage
+
+# Or using journalctl
+journalctl -f -t ssl-storage
+```
+
+### Journald
+
+Logs to systemd's journald. Best for systemd-based systems.
+
+```yaml
+logging:
+  output: "journald"
+  level: "info"
+```
+
+**View journald logs:**
+```bash
+# Follow logs in real-time
+journalctl -f -u ssl-storage
+
+# View all logs for the service
+journalctl -u ssl-storage
+
+# View logs with specific priority
+journalctl -u ssl-storage -p info
+```
+
+### Log Levels
+
+Available log levels (from most to least verbose):
+- `trace` - Very detailed debugging information
+- `debug` - Debugging information
+- `info` - Informational messages (recommended)
+- `warn` - Warning messages
+- `error` - Error messages only
+
+The log level can also be set via the `RUST_LOG` environment variable, which takes precedence over the config file:
+
+```bash
+RUST_LOG=debug ssl-storage --config config.yaml
+```
+
 ## Environment Variables
 
 - `REDIS_URL`: Redis connection URL (overrides config file setting)
+- `RUST_LOG`: Log level override (e.g., `trace`, `debug`, `info`, `warn`, `error`)
 
 ## Examples
 
