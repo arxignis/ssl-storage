@@ -1,5 +1,5 @@
 use clap::Parser;
-use ssl_storage::{request_cert, should_renew_certs_check, AppConfig, DomainReaderFactory};
+use ssl_storage::{request_cert, should_renew_certs_check, should_retry_failed_cert, AppConfig, DomainReaderFactory, StorageFactory};
 use std::path::PathBuf;
 use tracing::{info, warn, Level};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
@@ -39,6 +39,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Loaded configuration from {}", args.config);
 
+    info!("Starting HTTP server for ACME challenges...");
+    let app_config_clone = app_config.clone();
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = ssl_storage::start_http_server(&app_config_clone).await {
+            warn!("HTTP server error: {}", e);
+        }
+    });
+
+    // Give the server a moment to start
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
     // Create domain reader based on config
     let domain_reader = DomainReaderFactory::create(&app_config.domains)
         .map_err(|e| format!("Failed to create domain reader: {}", e))?;
@@ -56,27 +67,142 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let https_path = PathBuf::from(&app_config.storage.https_path);
 
-    // Process each domain
+    // Start HTTP server for ACME challenges BEFORE processing certificates
+    // The server must be running to serve challenge files during certificate requests
+
+
+    // Process each domain initially
     for domain_config in domains.iter() {
         info!("Processing domain: {}", domain_config.domain);
 
         // Create domain-specific config
         let domain_cfg = app_config.create_domain_config(domain_config, https_path.clone());
 
+        // Ensure certificate hash exists for existing certificates (backward compatibility)
+        // This will generate hashes for certificates that were created before hash feature was added
+        let storage = StorageFactory::create_default(&domain_cfg)?;
+        if storage.cert_exists().await {
+            if let Err(e) = storage.get_certificate_hash().await {
+                warn!("Failed to get or generate certificate hash for {}: {}", domain_config.domain, e);
+            } else {
+                info!("Certificate hash verified/generated for {}", domain_config.domain);
+            }
+        }
+
         // Check if certificates need renewal
         if should_renew_certs_check(&domain_cfg).await? {
             info!("Requesting new certificate for {}...", domain_config.domain);
-            request_cert(&domain_cfg).await?;
-            info!("Certificate obtained successfully for {}!", domain_config.domain);
+            if let Err(e) = request_cert(&domain_cfg).await {
+                warn!("Failed to request certificate for {}: {}", domain_config.domain, e);
+            } else {
+                info!("Certificate obtained successfully for {}!", domain_config.domain);
+            }
         } else {
             info!("Certificates are still valid for {}.", domain_config.domain);
         }
     }
 
-    // Keep the program running after certificate operations
-    // Start HTTP server for ACME challenges
-    info!("Starting HTTP server for ACME challenges...");
-    ssl_storage::start_http_server(&app_config).await?;
+    // Periodic recheck loop for failed certificates
+    if app_config.acme.retry.enable_periodic_check {
+        info!("Periodic recheck enabled. Checking every {} seconds.", app_config.acme.retry.check_interval_seconds);
+
+        let check_interval = tokio::time::Duration::from_secs(app_config.acme.retry.check_interval_seconds);
+        let app_config_clone = app_config.clone();
+        let https_path_clone = https_path.clone();
+
+        let periodic_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(check_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                interval.tick().await;
+
+                info!("Starting periodic certificate recheck...");
+
+                // Re-read domains in case they've changed
+                let domain_reader = match DomainReaderFactory::create(&app_config_clone.domains) {
+                    Ok(reader) => reader,
+                    Err(e) => {
+                        warn!("Failed to create domain reader during periodic check: {}", e);
+                        continue;
+                    }
+                };
+
+                let domains = match domain_reader.read_domains().await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("Failed to read domains during periodic check: {}", e);
+                        continue;
+                    }
+                };
+
+                // Clean up expired challenges
+                let max_ttl = app_config_clone.acme.challenge_max_ttl_seconds;
+                for domain_config in domains.iter() {
+                    let domain_cfg = app_config_clone.create_domain_config(domain_config, https_path_clone.clone());
+                    let storage = match ssl_storage::StorageFactory::create_default(&domain_cfg) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            warn!("Failed to create storage for {}: {}", domain_config.domain, e);
+                            continue;
+                        }
+                    };
+                    if let Err(e) = storage.cleanup_expired_challenges(max_ttl).await {
+                        warn!("Failed to cleanup expired challenges for {}: {}", domain_config.domain, e);
+                    }
+                }
+
+                for domain_config in domains.iter() {
+                    let domain_cfg = app_config_clone.create_domain_config(domain_config, https_path_clone.clone());
+
+                    // Check if certificate exists and is valid
+                    let needs_renewal = match should_renew_certs_check(&domain_cfg).await {
+                        Ok(needs) => needs,
+                        Err(e) => {
+                            warn!("Failed to check certificate renewal for {}: {}", domain_config.domain, e);
+                            continue;
+                        }
+                    };
+
+                    // Check if there's a failed certificate that should be retried
+                    let should_retry = match should_retry_failed_cert(&domain_cfg, &app_config_clone.acme.retry).await {
+                        Ok(retry) => retry,
+                        Err(e) => {
+                            warn!("Failed to check retry status for {}: {}", domain_config.domain, e);
+                            false
+                        }
+                    };
+
+                    if needs_renewal || should_retry {
+                        if should_retry {
+                            info!("Retrying failed certificate generation for {}...", domain_config.domain);
+                        } else {
+                            info!("Requesting new certificate for {}...", domain_config.domain);
+                        }
+
+                        if let Err(e) = request_cert(&domain_cfg).await {
+                            warn!("Failed to request certificate for {}: {}", domain_config.domain, e);
+                        } else {
+                            info!("Certificate obtained successfully for {}!", domain_config.domain);
+                        }
+                    }
+                }
+
+                info!("Periodic certificate recheck complete. Next check in {} seconds.", app_config_clone.acme.retry.check_interval_seconds);
+            }
+        });
+
+        // Keep the program running - wait for both the HTTP server and periodic loop
+        info!("Certificate processing complete. HTTP server and periodic recheck will continue running.");
+        tokio::select! {
+            _ = server_handle => {},
+            _ = periodic_handle => {},
+        }
+    } else {
+        // Keep the program running - wait for the HTTP server
+        info!("Certificate processing complete. HTTP server will continue running.");
+        server_handle.await?;
+    }
 
     Ok(())
 }

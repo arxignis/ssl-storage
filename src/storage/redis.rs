@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::storage::Storage;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use redis::AsyncCommands;
 use std::path::PathBuf;
@@ -185,14 +185,16 @@ impl RedisStorage {
     }
 
     /// Execute a function with a distributed lock
-    /// Returns an error if the lock cannot be acquired
+    /// Returns Ok with default value if the lock cannot be acquired (skips operation)
     pub async fn with_lock<F, Fut, T>(&self, ttl_seconds: u64, f: F) -> Result<T>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
+        T: Default,
     {
         if !self.acquire_lock(ttl_seconds).await? {
-            return Err(anyhow::anyhow!("Failed to acquire lock for domain - another instance is processing this domain"));
+            tracing::warn!("Failed to acquire lock for domain - another instance is processing this domain. Skipping operation.");
+            return Ok(Default::default());
         }
 
         let result = f().await;
@@ -257,11 +259,24 @@ impl Storage for RedisStorage {
     }
 
     async fn write_certs(&self, cert: &[u8], chain: &[u8], key: &[u8]) -> Result<()> {
-        let mut conn = self.get_conn().await?;
+        tracing::info!("Connecting to Redis for certificate storage...");
+        let mut conn = self.get_conn().await
+            .with_context(|| "Failed to get Redis connection")?;
+        tracing::info!("Redis connection established");
 
         // Combine cert and chain to create fullchain
         let mut fullchain = cert.to_vec();
         fullchain.extend_from_slice(chain);
+        tracing::info!("Combined certificate chain (cert: {} bytes, chain: {} bytes, fullchain: {} bytes)",
+            cert.len(), chain.len(), fullchain.len());
+
+        // Calculate SHA256 hash of fullchain + key for change detection
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(&fullchain);
+        hasher.update(key);
+        let hash = format!("{:x}", hasher.finalize());
+        tracing::info!("Calculated certificate hash: {}", hash);
 
         // Delete old archived certificates (keep only live/current version)
         self.delete_archived_certs(&mut conn).await?;
@@ -276,10 +291,19 @@ impl Storage for RedisStorage {
 
         for (file_type, content) in live_files.iter() {
             let live_key = self.live_key(file_type);
+            tracing::info!("Writing {} to Redis key: {} ({} bytes)", file_type, live_key, content.len());
             conn.set::<_, _, ()>(&live_key, content).await
-                .with_context(|| format!("Failed to write live {} to Redis", file_type))?;
+                .with_context(|| format!("Failed to write live {} to Redis key: {}", file_type, live_key))?;
+            tracing::info!("Successfully wrote {} to Redis key: {}", file_type, live_key);
         }
 
+        // Store certificate hash for change detection
+        let hash_key = self.metadata_key("certificate_hash");
+        conn.set::<_, _, ()>(&hash_key, &hash).await
+            .with_context(|| format!("Failed to write certificate hash to Redis key: {}", hash_key))?;
+        tracing::info!("Stored certificate hash: {} at key: {}", hash, hash_key);
+
+        tracing::info!("All certificates written successfully to Redis");
         Ok(())
     }
 
@@ -318,9 +342,21 @@ impl Storage for RedisStorage {
         conn.set::<_, _, ()>(&challenge_key, key_auth).await
             .with_context(|| format!("Failed to write challenge token to Redis key: {}", challenge_key))?;
 
+        // Store challenge timestamp
+        let timestamp = chrono::Utc::now();
+        let timestamp_key = format!("{}:timestamp", challenge_key);
+        conn.set::<_, _, ()>(&timestamp_key, timestamp.to_rfc3339()).await
+            .with_context(|| format!("Failed to write challenge timestamp to Redis key: {}", timestamp_key))?;
+
         // Also write to filesystem for HTTP-01 challenge serving
         // The HTTP server needs to serve these files
-        let mut well_known_folder = self.static_path.clone();
+        // Write challenge files to a shared location (not per-domain)
+        // This allows the HTTP server to serve them from a single base path
+        let base_path = self.static_path.parent()
+            .ok_or_else(|| anyhow!("Cannot get parent path from static_path"))?
+            .to_path_buf();
+
+        let mut well_known_folder = base_path.clone();
         well_known_folder.push("well-known");
         tokio::fs::create_dir_all(&well_known_folder)
             .await
@@ -368,7 +404,248 @@ impl Storage for RedisStorage {
         conn.set::<_, _, ()>(&dns_key, challenge_data.to_string()).await
             .with_context(|| format!("Failed to write DNS challenge to Redis key: {}", dns_key))?;
 
+        // Store DNS challenge timestamp
+        let timestamp = chrono::Utc::now();
+        let timestamp_key = format!("{}:timestamp", dns_key);
+        conn.set::<_, _, ()>(&timestamp_key, timestamp.to_rfc3339()).await
+            .with_context(|| format!("Failed to write DNS challenge timestamp to Redis key: {}", timestamp_key))?;
+
         tracing::info!("DNS challenge code saved to Redis: {} = {}", dns_record, dns_value);
+        Ok(())
+    }
+
+    async fn read_account_credentials(&self) -> Result<Option<String>> {
+        let mut conn = self.get_conn().await?;
+        // Use a shared key for account credentials (not per-domain)
+        let creds_key = "ssl-storage:acme:account_credentials";
+
+        let result: Option<String> = conn.get(creds_key).await
+            .with_context(|| format!("Failed to read account credentials from Redis key: {}", creds_key))?;
+
+        Ok(result)
+    }
+
+    async fn write_account_credentials(&self, credentials: &str) -> Result<()> {
+        let mut conn = self.get_conn().await?;
+        // Use a shared key for account credentials (not per-domain)
+        let creds_key = "ssl-storage:acme:account_credentials";
+
+        conn.set::<_, _, ()>(creds_key, credentials).await
+            .with_context(|| format!("Failed to write account credentials to Redis key: {}", creds_key))?;
+
+        Ok(())
+    }
+
+    async fn record_failure(&self, error: &str) -> Result<()> {
+        let mut conn = self.get_conn().await?;
+        let failure_key = self.metadata_key("cert_failure");
+        let count_key = self.metadata_key("cert_failure_count");
+
+        // Read current failure count
+        let count: u32 = conn.get(&count_key).await.unwrap_or(0);
+        let new_count = count + 1;
+
+        // Write failure record
+        let failure_data = serde_json::json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "error": error,
+            "count": new_count,
+        });
+
+        conn.set::<_, _, ()>(&failure_key, failure_data.to_string()).await
+            .with_context(|| format!("Failed to write failure record to Redis key: {}", failure_key))?;
+
+        // Write failure count
+        conn.set::<_, _, ()>(&count_key, new_count.to_string()).await
+            .with_context(|| format!("Failed to write failure count to Redis key: {}", count_key))?;
+
+        Ok(())
+    }
+
+    async fn get_last_failure(&self) -> Result<Option<(chrono::DateTime<chrono::Utc>, String)>> {
+        let mut conn = self.get_conn().await?;
+        let failure_key = self.metadata_key("cert_failure");
+
+        let content: Option<String> = conn.get(&failure_key).await
+            .with_context(|| format!("Failed to read failure record from Redis key: {}", failure_key))?;
+
+        let content = match content {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        let failure_data: serde_json::Value = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse failure record: {}", content))?;
+
+        let timestamp_str = failure_data["timestamp"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing timestamp in failure record"))?;
+        let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp_str)
+            .with_context(|| format!("Failed to parse timestamp: {}", timestamp_str))?
+            .with_timezone(&chrono::Utc);
+
+        let error = failure_data["error"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing error in failure record"))?
+            .to_string();
+
+        Ok(Some((timestamp, error)))
+    }
+
+    async fn clear_failure(&self) -> Result<()> {
+        let mut conn = self.get_conn().await?;
+        let failure_key = self.metadata_key("cert_failure");
+        let count_key = self.metadata_key("cert_failure_count");
+
+        conn.del::<_, ()>(&failure_key).await.ok();
+        conn.del::<_, ()>(&count_key).await.ok();
+
+        Ok(())
+    }
+
+    async fn get_failure_count(&self) -> Result<u32> {
+        let mut conn = self.get_conn().await?;
+        let count_key = self.metadata_key("cert_failure_count");
+
+        let count: Option<String> = conn.get(&count_key).await
+            .with_context(|| format!("Failed to read failure count from Redis key: {}", count_key))?;
+
+        let count = match count {
+            Some(c) => c.trim().parse::<u32>().unwrap_or(0),
+            None => 0,
+        };
+
+        Ok(count)
+    }
+
+    async fn get_certificate_hash(&self) -> Result<Option<String>> {
+        let mut conn = self.get_conn().await?;
+        let hash_key = self.metadata_key("certificate_hash");
+
+        // Check if hash exists
+        let hash: Option<String> = conn.get(&hash_key).await
+            .with_context(|| format!("Failed to read certificate hash from Redis key: {}", hash_key))?;
+
+        if let Some(hash) = hash {
+            return Ok(Some(hash));
+        }
+
+        // Hash doesn't exist, but check if certificate exists
+        if !self.cert_exists().await {
+            return Ok(None);
+        }
+
+        // Certificate exists but hash doesn't - generate it
+        let fullchain = self.read_fullchain().await?;
+        let key = self.read_key().await?;
+
+        // Calculate SHA256 hash of fullchain + key
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(&fullchain);
+        hasher.update(&key);
+        let hash = format!("{:x}", hasher.finalize());
+
+        // Store the hash for future use
+        conn.set::<_, _, ()>(&hash_key, &hash).await
+            .with_context(|| format!("Failed to write certificate hash to Redis key: {}", hash_key))?;
+
+        Ok(Some(hash))
+    }
+
+    async fn get_challenge_timestamp(&self, token: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let mut conn = self.get_conn().await?;
+        let challenge_key = self.challenge_key(token);
+        let timestamp_key = format!("{}:timestamp", challenge_key);
+
+        let content: Option<String> = conn.get(&timestamp_key).await
+            .with_context(|| format!("Failed to read challenge timestamp from Redis key: {}", timestamp_key))?;
+
+        let content = match content {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        let timestamp = chrono::DateTime::parse_from_rfc3339(content.trim())
+            .with_context(|| format!("Failed to parse challenge timestamp: {}", content))?
+            .with_timezone(&chrono::Utc);
+
+        Ok(Some(timestamp))
+    }
+
+    async fn get_dns_challenge_timestamp(&self, _domain: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let mut conn = self.get_conn().await?;
+        let dns_key = self.dns_challenge_key();
+        let timestamp_key = format!("{}:timestamp", dns_key);
+
+        let content: Option<String> = conn.get(&timestamp_key).await
+            .with_context(|| format!("Failed to read DNS challenge timestamp from Redis key: {}", timestamp_key))?;
+
+        let content = match content {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        let timestamp = chrono::DateTime::parse_from_rfc3339(content.trim())
+            .with_context(|| format!("Failed to parse DNS challenge timestamp: {}", content))?
+            .with_timezone(&chrono::Utc);
+
+        Ok(Some(timestamp))
+    }
+
+    async fn is_challenge_expired(&self, token: &str, max_ttl_seconds: u64) -> Result<bool> {
+        let timestamp = match self.get_challenge_timestamp(token).await? {
+            Some(ts) => ts,
+            None => return Ok(true), // No timestamp means expired
+        };
+
+        let now = chrono::Utc::now();
+        let age = now - timestamp;
+        let age_seconds = age.num_seconds() as u64;
+
+        Ok(age_seconds >= max_ttl_seconds)
+    }
+
+    async fn is_dns_challenge_expired(&self, _domain: &str, max_ttl_seconds: u64) -> Result<bool> {
+        let timestamp = match self.get_dns_challenge_timestamp(_domain).await? {
+            Some(ts) => ts,
+            None => return Ok(true), // No timestamp means expired
+        };
+
+        let now = chrono::Utc::now();
+        let age = now - timestamp;
+        let age_seconds = age.num_seconds() as u64;
+
+        Ok(age_seconds >= max_ttl_seconds)
+    }
+
+    async fn cleanup_expired_challenges(&self, max_ttl_seconds: u64) -> Result<()> {
+        let mut conn = self.get_conn().await?;
+
+        // Get all challenge keys matching the pattern
+        let challenge_pattern = format!("{}:challenge:*", self.base_key);
+        let keys: Vec<String> = conn.keys(&challenge_pattern).await
+            .with_context(|| format!("Failed to get challenge keys matching {}", challenge_pattern))?;
+
+        for challenge_key in keys {
+            // Skip timestamp keys
+            if challenge_key.ends_with(":timestamp") {
+                continue;
+            }
+
+            // Extract token from key (format: base_key:challenge:token)
+            if let Some(token) = challenge_key.split(':').last() {
+                if let Ok(expired) = self.is_challenge_expired(token, max_ttl_seconds).await {
+                    if expired {
+                        let timestamp_key = format!("{}:timestamp", challenge_key);
+                        // Remove challenge and timestamp
+                        conn.del::<_, ()>(&challenge_key).await.ok();
+                        conn.del::<_, ()>(&timestamp_key).await.ok();
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 }

@@ -9,11 +9,11 @@ mod storage;
 mod domain_reader;
 
 pub use errors::AtomicServerResult;
-pub use config::{Config, ConfigOpts, AppConfig};
+pub use config::{Config, ConfigOpts, AppConfig, RetryConfig};
 pub use storage::{Storage, StorageFactory, StorageType};
 pub use domain_reader::{DomainConfig, DomainReader, DomainReaderFactory};
 
-use actix_web::{dev::ServerHandle, App, HttpServer, HttpResponse, web, Responder};
+use actix_web::{App, HttpServer, HttpResponse, web, Responder};
 use anyhow::{anyhow, Context};
 use serde::Serialize;
 use std::io::BufReader;
@@ -66,6 +66,50 @@ pub fn get_https_config(
     Ok(server_config)
 }
 
+/// Check if a failed certificate should be retried based on exponential backoff
+pub async fn should_retry_failed_cert(
+    config: &crate::config::Config,
+    retry_config: &crate::config::RetryConfig,
+) -> AtomicServerResult<bool> {
+    let storage = StorageFactory::create_default(config)?;
+
+    // Check if there's a failure record
+    let last_failure = match storage.get_last_failure().await {
+        Ok(Some((timestamp, _))) => timestamp,
+        Ok(None) => return Ok(false), // No failure recorded
+        Err(e) => {
+            warn!("Failed to read failure record: {}", e);
+            return Ok(false);
+        }
+    };
+
+    // Check if max retries exceeded
+    let failure_count = storage.get_failure_count().await.unwrap_or(0);
+    if retry_config.max_retries > 0 && failure_count >= retry_config.max_retries {
+        warn!("Maximum retry count ({}) exceeded for domain {}. Skipping retry.", retry_config.max_retries, config.opts.domain);
+        return Ok(false);
+    }
+
+    // Calculate exponential backoff delay
+    // Formula: min(min_retry_delay * 2^(failure_count - 1), max_retry_delay)
+    let base_delay = retry_config.min_retry_delay_seconds as f64;
+    let exponential_delay = base_delay * (2.0_f64.powi((failure_count.saturating_sub(1)) as i32));
+    let delay_seconds = exponential_delay.min(retry_config.max_retry_delay_seconds as f64) as u64;
+
+    let now = chrono::Utc::now();
+    let time_since_failure = now - last_failure;
+    let time_since_failure_secs = time_since_failure.num_seconds() as u64;
+
+    if time_since_failure_secs >= delay_seconds {
+        info!("Retry delay ({}) has passed for domain {}. Last failure was {} seconds ago. Will retry.", delay_seconds, config.opts.domain, time_since_failure_secs);
+        Ok(true)
+    } else {
+        let remaining = delay_seconds - time_since_failure_secs;
+        info!("Retry delay not yet reached for domain {}. Will retry in {} seconds.", config.opts.domain, remaining);
+        Ok(false)
+    }
+}
+
 /// Checks if the certificates need to be renewed.
 /// Will be true if there are no certs yet.
 pub async fn should_renew_certs_check(config: &crate::config::Config) -> AtomicServerResult<bool> {
@@ -76,6 +120,11 @@ pub async fn should_renew_certs_check(config: &crate::config::Config) -> AtomicS
             "No HTTPS certificates found, requesting new ones...",
         );
         return Ok(true);
+    }
+
+    // Ensure certificate hash exists (generate if missing for backward compatibility)
+    if let Err(e) = storage.get_certificate_hash().await {
+        warn!("Failed to get or generate certificate hash: {}", e);
     }
 
     let created_at = match storage.read_created_at().await {
@@ -139,6 +188,11 @@ async fn get_cert_expiration_info(
             needs_renewal: true,
             renewing: false,
         });
+    }
+
+    // Ensure certificate hash exists (generate if missing for backward compatibility)
+    if let Err(e) = storage.get_certificate_hash().await {
+        warn!("Failed to get or generate certificate hash for {}: {}", domain, e);
     }
 
     let created_at = match storage.read_created_at().await {
@@ -381,82 +435,19 @@ async fn check_dns_txt_record(record_name: &str, expected_value: &str, max_attem
     false
 }
 
-/// Starts an HTTP Actix server for HTTPS certificate initialization
+/// Writes challenge file for HTTP-01 challenge
+/// The main HTTP server will serve this file - no temporary server needed
 async fn cert_init_server(
     config: &crate::config::Config,
     challenge: &instant_acme::Challenge,
     key_auth: &str,
-) -> AtomicServerResult<ServerHandle> {
-    let address = format!("{}:{}", config.opts.ip, config.opts.port);
-
-    if config.opts.port != 80 {
-        warn!(
-            "HTTP port is {}, not 80. Should be 80 in most cases during LetsEncrypt setup. If you've correctly forwarded it, you can ignore this warning.",
-            config.opts.port
-        );
-    }
-
+) -> AtomicServerResult<()> {
     let storage = StorageFactory::create_default(config)?;
     storage.write_challenge(&challenge.token.to_string(), key_auth).await?;
-    let well_known_folder = storage.static_path();
-    let mut well_known_path = well_known_folder.clone();
-    well_known_path.push("well-known");
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    info!("Challenge file written. Main HTTP server will serve it at /.well-known/acme-challenge/{}", challenge.token);
 
-    std::thread::spawn(move || {
-        actix_web::rt::System::new().block_on(async move {
-            info!(
-                "Starting HTTP server for HTTPS initialization at {}",
-                &address
-            );
-            let well_known_path_clone = well_known_path.clone();
-            let init_server = HttpServer::new(move || {
-                App::new().service(
-                    actix_files::Files::new("/.well-known", well_known_path_clone.clone())
-                        .show_files_listing(),
-                )
-            });
-
-            let running_server = init_server.bind(&address)?.run();
-
-            tx.send(running_server.handle())
-                .expect("Error sending handle during HTTPS init.");
-
-            running_server.await
-        })
-    });
-
-    let handle = rx
-        .recv()
-        .context("Error receiving handle during HTTPS init")?;
-
-    let well_known_url = format!(
-        "http://{}/.well-known/acme-challenge/{}",
-        &config.opts.domain, &challenge.token.to_string()
-    );
-
-    // wait for a few secs
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    info!("Testing availability of {}", &well_known_url);
-
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(2)))
-        .build();
-    let agent: ureq::Agent = config.into();
-    let resp = agent
-        .get(&well_known_url)
-        // .get("https://docs.certifytheweb.com/docs/http-validation/")
-        .call()
-        .with_context(|| format!(
-            "Unable to test local server. Is it available at the right address?"
-        ))?;
-    if resp.status() != 200 {
-        warn!("Unable to test local server. Status: {}", resp.status());
-    } else {
-        info!("Server for HTTP initialization running correctly");
-    }
-    Ok(handle)
+    Ok(())
 }
 
 /// Sends a request to LetsEncrypt to create a certificate
@@ -486,6 +477,168 @@ pub async fn request_cert(config: &crate::config::Config) -> AtomicServerResult<
 
     // For file storage, proceed without lock
     request_cert_internal(config).await
+}
+
+/// Parse retry-after timestamp from rate limit error message
+/// Returns the retry-after timestamp if found, None otherwise
+fn parse_retry_after(error_msg: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    // Look for "retry after YYYY-MM-DD HH:MM:SS UTC" pattern
+    if let Some(pos) = error_msg.find("retry after") {
+        let after_text = &error_msg[pos + "retry after".len()..].trim();
+        // Try to parse the timestamp (format: "2025-11-10 18:08:38 UTC")
+        if let Ok(dt) = chrono::DateTime::parse_from_str(after_text, "%Y-%m-%d %H:%M:%S %Z") {
+            return Some(dt.with_timezone(&chrono::Utc));
+        }
+        // Try alternative format without timezone (assume UTC)
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(after_text, "%Y-%m-%d %H:%M:%S") {
+            return Some(chrono::DateTime::from_naive_utc_and_offset(dt, chrono::Utc));
+        }
+        // Try parsing as RFC3339 format
+        if let Ok(dt) = after_text.parse::<chrono::DateTime<chrono::Utc>>() {
+            return Some(dt);
+        }
+    }
+    None
+}
+
+/// Helper function to check if an account already exists
+async fn check_account_exists(
+    email: &str,
+    lets_encrypt_url: &str,
+) -> Result<Option<(instant_acme::Account, instant_acme::AccountCredentials)>, anyhow::Error> {
+    match instant_acme::Account::builder()
+        .context("Failed to create account builder")?
+        .create(
+            &instant_acme::NewAccount {
+                contact: &[&format!("mailto:{}", email)],
+                terms_of_service_agreed: true,
+                only_return_existing: true,
+            },
+            lets_encrypt_url.to_string(),
+            None,
+        )
+        .await
+    {
+        Ok((acc, cr)) => Ok(Some((acc, cr))),
+        Err(e) => {
+            let error_msg = format!("{}", e);
+            // If it's a rate limit error, propagate it
+            if error_msg.contains("rateLimited") || error_msg.contains("rate limit") || error_msg.contains("too many") {
+                return Err(e.into());
+            }
+            // Otherwise, account doesn't exist
+            Ok(None)
+        }
+    }
+}
+
+/// Helper function to create a new Let's Encrypt account and save credentials
+/// Handles rate limits by waiting for the retry-after time
+async fn create_new_account(
+    storage: &Box<dyn Storage>,
+    email: &str,
+    lets_encrypt_url: &str,
+) -> AtomicServerResult<(instant_acme::Account, instant_acme::AccountCredentials)> {
+    // First, check if account already exists
+    match check_account_exists(email, lets_encrypt_url).await {
+        Ok(Some((acc, cr))) => {
+            info!("Account already exists for email {}, reusing it", email);
+            return Ok((acc, cr));
+        }
+        Ok(None) => {
+            // Account doesn't exist, proceed to create
+        }
+        Err(e) => {
+            // Check if it's a rate limit error
+            let error_msg = format!("{}", e);
+            if error_msg.contains("rateLimited") || error_msg.contains("rate limit") || error_msg.contains("too many") {
+                if let Some(retry_after) = parse_retry_after(&error_msg) {
+                    let now = chrono::Utc::now();
+                    if retry_after > now {
+                        let wait_duration = retry_after - now;
+                        let wait_secs = wait_duration.num_seconds().max(0) as u64;
+                        warn!("Rate limit hit. Waiting {} seconds until {} before retrying account creation", wait_secs, retry_after);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(wait_secs + 1)).await;
+                    }
+                } else {
+                    // Rate limit error but couldn't parse retry-after, wait a default time
+                    warn!("Rate limit hit but couldn't parse retry-after time. Waiting 3 hours (10800 seconds) before retrying");
+                    tokio::time::sleep(tokio::time::Duration::from_secs(10800)).await;
+                }
+            } else {
+                // Not a rate limit error, propagate it
+                return Err(e);
+            }
+        }
+    }
+
+    info!("Creating new LetsEncrypt account with email {}", email);
+
+    // Retry account creation (after waiting for rate limit if needed)
+    let max_retries = 3;
+    let mut retry_count = 0;
+
+    loop {
+        match instant_acme::Account::builder()
+            .context("Failed to create account builder")?
+            .create(
+                &instant_acme::NewAccount {
+                    contact: &[&format!("mailto:{}", email)],
+                    terms_of_service_agreed: true,
+                    only_return_existing: false,
+                },
+                lets_encrypt_url.to_string(),
+                None,
+            )
+            .await
+        {
+            Ok((account, creds)) => {
+                // Save credentials for future use (store as JSON value for now)
+                if let Ok(creds_json) = serde_json::to_string(&creds) {
+                    if let Err(e) = storage.write_account_credentials(&creds_json).await {
+                        warn!("Failed to save account credentials to storage: {}. Account will be recreated on next run.", e);
+                    } else {
+                        info!("Saved LetsEncrypt account credentials to storage");
+                    }
+                } else {
+                    warn!("Failed to serialize account credentials. Account will be recreated on next run.");
+                }
+                return Ok((account, creds));
+            }
+            Err(e) => {
+                let error_msg = format!("{}", e);
+
+                // Check if it's a rate limit error
+                if error_msg.contains("rateLimited") || error_msg.contains("rate limit") || error_msg.contains("too many") {
+                    if let Some(retry_after) = parse_retry_after(&error_msg) {
+                        let now = chrono::Utc::now();
+                        if retry_after > now {
+                            let wait_duration = retry_after - now;
+                            let wait_secs = wait_duration.num_seconds().max(0) as u64;
+                            warn!("Rate limit hit during account creation. Waiting {} seconds until {} before retrying", wait_secs, retry_after);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(wait_secs + 1)).await;
+                            retry_count += 1;
+                            if retry_count < max_retries {
+                                continue;
+                            }
+                        }
+                    } else {
+                        // Rate limit error but couldn't parse retry-after
+                        if retry_count < max_retries {
+                            let wait_secs = 10800; // 3 hours default
+                            warn!("Rate limit hit but couldn't parse retry-after time. Waiting {} seconds before retrying", wait_secs);
+                            tokio::time::sleep(tokio::time::Duration::from_secs(wait_secs)).await;
+                            retry_count += 1;
+                            continue;
+                        }
+                    }
+                }
+
+                // If we've exhausted retries or it's not a rate limit error, return the error
+                return Err(e).context("Failed to create account");
+            }
+        }
+    }
 }
 
 async fn request_cert_internal(config: &crate::config::Config) -> AtomicServerResult<()> {
@@ -525,21 +678,74 @@ async fn request_cert_internal(config: &crate::config::Config) -> AtomicServerRe
             "No email set - required for HTTPS certificate initialization with LetsEncrypt",
         );
 
-    info!("Creating LetsEncrypt account with email {}", email);
+    // Try to load existing account credentials from storage
+    let storage = StorageFactory::create_default(config)?;
+    let existing_creds = storage.read_account_credentials().await
+        .context("Failed to read account credentials from storage")?;
 
-    let (account, _creds) = instant_acme::Account::builder()
-        .context("Failed to create account builder")?
-        .create(
-            &instant_acme::NewAccount {
-                contact: &[&format!("mailto:{}", email)],
-                terms_of_service_agreed: true,
-                only_return_existing: false,
-            },
-            lets_encrypt_url.to_string(),
-            None,
-        )
-        .await
-        .context("Failed to create account")?;
+    // Try to restore account from stored credentials, but fall back to creating new account if it fails
+    let (account, _creds) = match existing_creds {
+        Some(creds_json) => {
+            // Try to restore account from existing credentials
+            info!("Attempting to restore LetsEncrypt account from stored credentials");
+
+            // First try to parse and restore from stored credentials
+            match serde_json::from_str::<instant_acme::AccountCredentials>(&creds_json) {
+                Ok(creds) => {
+                    // Try to restore account from credentials
+                    // Use AccountBuilder to restore from credentials
+                    match instant_acme::Account::builder()
+                        .context("Failed to create account builder")?
+                        .from_credentials(creds)
+                        .await
+                    {
+                        Ok(acc) => {
+                            info!("Successfully restored LetsEncrypt account from stored credentials");
+                            // Get the credentials back from the account (they're stored in the account)
+                            // For now, we'll use the stored credentials JSON
+                            let restored_creds = serde_json::from_str::<instant_acme::AccountCredentials>(&creds_json)
+                                .expect("Credentials were just parsed successfully");
+                            (acc, restored_creds)
+                        }
+                        Err(e) => {
+                            let error_msg = format!("{}", e);
+                            warn!("Failed to restore account from stored credentials: {}. Will check if account exists.", error_msg);
+
+                            // If restoration fails, check if account exists
+                            match check_account_exists(&email, lets_encrypt_url).await {
+                                Ok(Some((acc, cr))) => {
+                                    info!("Account exists but credentials were invalid. Using existing account.");
+                                    (acc, cr)
+                                }
+                                Ok(None) => {
+                                    warn!("Stored credentials invalid and account doesn't exist. Creating new account.");
+                                    create_new_account(&storage, &email, lets_encrypt_url).await?
+                                }
+                                Err(e) => {
+                                    let error_msg = format!("{}", e);
+                                    if error_msg.contains("rateLimited") || error_msg.contains("rate limit") || error_msg.contains("too many") {
+                                        warn!("Rate limit hit while checking account. Will wait and retry in create_new_account.");
+                                        create_new_account(&storage, &email, lets_encrypt_url).await?
+                                    } else {
+                                        warn!("Failed to check account existence: {}. Creating new account.", e);
+                                        create_new_account(&storage, &email, lets_encrypt_url).await?
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to parse stored credentials: {}. Creating new account.", e);
+                    create_new_account(&storage, &email, lets_encrypt_url).await?
+                }
+            }
+        }
+        None => {
+            // No stored credentials, create a new account
+            create_new_account(&storage, &email, lets_encrypt_url).await?
+        }
+    };
 
     // Create the ACME order based on the given domain names.
     // Note that this only needs an `&Account`, so the library will let you
@@ -557,10 +763,21 @@ async fn request_cert_internal(config: &crate::config::Config) -> AtomicServerRe
     }
     let identifier = instant_acme::Identifier::Dns(domain);
     let identifiers = vec![identifier];
-    let mut order = account
+    let storage = StorageFactory::create_default(config)?;
+    let mut order = match account
         .new_order(&instant_acme::NewOrder::new(&identifiers))
         .await
-        .context("Failed to create new order")?;
+    {
+        Ok(order) => order,
+        Err(e) => {
+            let error_msg = format!("Failed to create new order for domain {}: {}", config.opts.domain, e);
+            warn!("{}. Skipping certificate request.", error_msg);
+            if let Err(record_err) = storage.record_failure(&error_msg).await {
+                warn!("Failed to record failure: {}", record_err);
+            }
+            return Ok(());
+        }
+    };
 
     assert!(matches!(
         order.state().status,
@@ -570,10 +787,15 @@ async fn request_cert_internal(config: &crate::config::Config) -> AtomicServerRe
     // Pick the desired challenge type and prepare the response.
     let mut authorizations = order.authorizations();
     let mut challenges_set = Vec::new();
-    let mut handle: Option<ServerHandle> = None;
 
     while let Some(result) = authorizations.next().await {
-        let mut authz = result.context("Failed to get authorization")?;
+        let mut authz = match result {
+            Ok(authz) => authz,
+            Err(e) => {
+                warn!("Failed to get authorization: {}. Skipping this authorization.", e);
+                continue;
+            }
+        };
         let domain = authz.identifier().to_string();
 
         match authz.status {
@@ -593,7 +815,21 @@ async fn request_cert_internal(config: &crate::config::Config) -> AtomicServerRe
         let key_auth = challenge.key_authorization().as_str().to_string();
         match challenge_type {
             instant_acme::ChallengeType::Http01 => {
-                handle = Some(cert_init_server(config, &challenge, &key_auth).await?);
+                // Check if existing challenge is expired and clean it up
+                let storage = StorageFactory::create_default(config)?;
+                let challenge_token = challenge.token.to_string();
+                if let Ok(Some(_)) = storage.get_challenge_timestamp(&challenge_token).await {
+                    // Challenge exists, check if expired
+                    let max_ttl = config.opts.challenge_max_ttl_seconds.unwrap_or(3600);
+                    if let Ok(true) = storage.is_challenge_expired(&challenge_token, max_ttl).await {
+                        info!("Existing challenge for token {} is expired (TTL: {}s), will be replaced", challenge_token, max_ttl);
+                    }
+                }
+
+                if let Err(e) = cert_init_server(config, &challenge, &key_auth).await {
+                    warn!("Failed to write challenge file for HTTP-01 challenge: {}. Skipping HTTP-01 challenge.", e);
+                    continue;
+                }
             }
             instant_acme::ChallengeType::Dns01 => {
                 // For wildcard domains (*.example.com), strip the wildcard prefix
@@ -605,8 +841,17 @@ async fn request_cert_internal(config: &crate::config::Config) -> AtomicServerRe
                 info!("DNS-01 challenge for domain '{}':", domain);
                 info!("  {} IN TXT {}", dns_record, dns_value);
 
-                // Save DNS challenge code to storage (Redis or file)
+                // Check if existing DNS challenge is expired and clean it up
                 let storage = StorageFactory::create_default(config)?;
+                if let Ok(Some(_)) = storage.get_dns_challenge_timestamp(&domain).await {
+                    // DNS challenge exists, check if expired
+                    let max_ttl = config.opts.challenge_max_ttl_seconds.unwrap_or(3600);
+                    if let Ok(true) = storage.is_dns_challenge_expired(&domain, max_ttl).await {
+                        info!("Existing DNS challenge for domain {} is expired (TTL: {}s), will be replaced", domain, max_ttl);
+                    }
+                }
+
+                // Save DNS challenge code to storage (Redis or file)
                 if let Err(e) = storage.write_dns_challenge(&domain, &dns_record, &dns_value).await {
                     warn!("Failed to save DNS challenge code to storage: {}", e);
                 }
@@ -619,15 +864,27 @@ async fn request_cert_internal(config: &crate::config::Config) -> AtomicServerRe
                 let dns_ready = check_dns_txt_record(&dns_record, &dns_value, max_attempts, delay_seconds).await;
 
                 if !dns_ready {
-                    warn!("DNS record not found after checking. Please verify the DNS record is set correctly.");
-                    warn!("Record: {} IN TXT {}", dns_record, dns_value);
-                    return Err(anyhow!("DNS record not found for domain {}", domain));
+                    let error_msg = format!("DNS record not found after checking for domain {}. Record: {} IN TXT {}", domain, dns_record, dns_value);
+                    warn!("{}. Please verify the DNS record is set correctly.", error_msg);
+                    let storage = StorageFactory::create_default(config)?;
+                    if let Err(record_err) = storage.record_failure(&error_msg).await {
+                        warn!("Failed to record failure: {}", record_err);
+                    }
+                    return Ok(());
                 }
 
                 info!("DNS record found! Proceeding with challenge validation...");
             }
             instant_acme::ChallengeType::TlsAlpn01 => todo!("TLS-ALPN-01 is not supported"),
-            _ => return Err(anyhow!("Unsupported challenge type: {:?}", challenge_type)),
+            _ => {
+                let error_msg = format!("Unsupported challenge type: {:?}", challenge_type);
+                warn!("{}", error_msg);
+                let storage = StorageFactory::create_default(config)?;
+                if let Err(record_err) = storage.record_failure(&error_msg).await {
+                    warn!("Failed to record failure: {}", record_err);
+                }
+                return Ok(());
+            }
         }
 
         // Notify ACME server to validate
@@ -638,7 +895,13 @@ async fn request_cert_internal(config: &crate::config::Config) -> AtomicServerRe
     }
 
     if challenges_set.is_empty() {
-        return Err(anyhow!("All domains failed challenge setup"));
+        let error_msg = format!("All domains failed challenge setup for domain {}", config.opts.domain);
+        warn!("{}", error_msg);
+        let storage = StorageFactory::create_default(config)?;
+        if let Err(record_err) = storage.record_failure(&error_msg).await {
+            warn!("Failed to record failure: {}", record_err);
+        }
+        return Ok(());
     }
 
     // Exponentially back off until the order becomes ready or invalid.
@@ -648,7 +911,13 @@ async fn request_cert_internal(config: &crate::config::Config) -> AtomicServerRe
             Ok(s) => s,
             Err(e) => {
                 if tries >= 10 {
-                    return Err(anyhow!("Order refresh failed after {} attempts: {}", tries, e));
+                    let error_msg = format!("Order refresh failed after {} attempts: {}", tries, e);
+                    warn!("{}", error_msg);
+                    let storage = StorageFactory::create_default(config)?;
+                    if let Err(record_err) = storage.record_failure(&error_msg).await {
+                        warn!("Failed to record failure: {}", record_err);
+                    }
+                    return Ok(());
                 }
                 tries += 1;
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -663,7 +932,13 @@ async fn request_cert_internal(config: &crate::config::Config) -> AtomicServerRe
 
         tries += 1;
         if tries >= 10 {
-            return Err(anyhow!("Giving up: order is not ready after {} attempts", tries));
+            let error_msg = format!("Giving up: order is not ready after {} attempts for domain {}", tries, config.opts.domain);
+            warn!("{}", error_msg);
+            let storage = StorageFactory::create_default(config)?;
+            if let Err(record_err) = storage.record_failure(&error_msg).await {
+                warn!("Failed to record failure: {}", record_err);
+            }
+            return Ok(());
         }
 
         let delay = std::time::Duration::from_secs(2 + tries as u64);
@@ -672,7 +947,48 @@ async fn request_cert_internal(config: &crate::config::Config) -> AtomicServerRe
     };
 
     if state.status == OrderStatus::Invalid {
-        return Err(anyhow!("order is invalid"));
+        // Try to get more details about why the order is invalid
+        let mut error_details = Vec::new();
+        if let Some(error) = &state.error {
+            error_details.push(format!("Order error: {:?}", error));
+        }
+
+        // Fetch authorization details from ACME server if state is None
+        for auth in &state.authorizations {
+            if let Some(auth_state) = &auth.state {
+                // Check authorization status for more details
+                match &auth_state.status {
+                    instant_acme::AuthorizationStatus::Invalid => {
+                        error_details.push(format!("Authorization {} is invalid", auth.url));
+                    }
+                    instant_acme::AuthorizationStatus::Expired => {
+                        error_details.push(format!("Authorization {} expired", auth.url));
+                    }
+                    instant_acme::AuthorizationStatus::Revoked => {
+                        error_details.push(format!("Authorization {} revoked", auth.url));
+                    }
+                    _ => {}
+                }
+            } else {
+                // Authorization state is None - this means the authorization details weren't included in the order state
+                // We can't fetch it again because order.authorizations() was already consumed
+                // Log the URL so the user can check it manually
+                warn!("Authorization state is None for {}. This usually means the authorization failed or expired. Check the authorization URL for details.", auth.url);
+                error_details.push(format!("Authorization {} state unavailable (check URL for details)", auth.url));
+            }
+        }
+
+        let error_msg = if error_details.is_empty() {
+            format!("Order is invalid but no error details available. Order state: {:#?}", state)
+        } else {
+            format!("Order is invalid. Details: {}", error_details.join("; "))
+        };
+        warn!("{}", error_msg);
+        let storage = StorageFactory::create_default(config)?;
+        if let Err(record_err) = storage.record_failure(&error_msg).await {
+            warn!("Failed to record failure: {}", record_err);
+        }
+        return Ok(());
     }
 
     // If the order is ready, we can provision the certificate.
@@ -691,22 +1007,38 @@ async fn request_cert_internal(config: &crate::config::Config) -> AtomicServerRe
             }
             Ok(None) => {
                 if tries > 10 {
-                    return Err(anyhow!("Giving up: certificate is still not ready"));
+                    let error_msg = format!("Giving up: certificate is still not ready after {} attempts", tries);
+                    let storage = StorageFactory::create_default(config)?;
+                    if let Err(record_err) = storage.record_failure(&error_msg).await {
+                        warn!("Failed to record failure: {}", record_err);
+                    }
+                    return Err(anyhow!("{}", error_msg));
                 }
                 tries += 1;
                 info!("Certificate not ready yet...");
                 continue;
             }
-            Err(e) => return Err(anyhow!("Error getting certificate: {}", e)),
+            Err(e) => {
+                let error_msg = format!("Error getting certificate: {}", e);
+                let storage = StorageFactory::create_default(config)?;
+                if let Err(record_err) = storage.record_failure(&error_msg).await {
+                    warn!("Failed to record failure: {}", record_err);
+                }
+                return Err(anyhow!("{}", error_msg));
+            }
         }
     };
 
-    write_certs(config, cert_chain_pem, private_key_pem).await?;
+    write_certs(config, cert_chain_pem, private_key_pem).await
+        .context("Failed to write certificates to storage")?;
 
-    if let Some(hnd) = handle {
-        warn!("HTTPS TLS Cert init successful! Stopping temporary HTTP server, starting HTTPS...");
-        hnd.stop(true).await;
+    // Clear any previous failure records since certificate was successfully generated
+    let storage = StorageFactory::create_default(config)?;
+    if let Err(clear_err) = storage.clear_failure().await {
+        warn!("Failed to clear failure record: {}", clear_err);
     }
+
+    info!("HTTPS TLS Cert init successful! Certificate written to storage.");
 
     Ok(())
 }
@@ -716,7 +1048,14 @@ async fn write_certs(
     cert_chain_pem: String,
     private_key_pem: String,
 ) -> AtomicServerResult<()> {
+    let storage_type = if let Some(storage_type_str) = &config.opts.storage_type {
+        storage_type_str.clone()
+    } else {
+        "file".to_string()
+    };
+    info!("Creating storage backend: {}", storage_type);
     let storage = StorageFactory::create_default(config)?;
+    info!("Storage backend created successfully");
 
     info!("Writing TLS certificates to storage (certbot-style)");
 
@@ -743,12 +1082,18 @@ async fn write_certs(
         String::new()
     };
 
+    info!("Writing certificate to storage backend...");
     storage.write_certs(
         domain_cert_pem.as_bytes(),
         chain_pem.as_bytes(),
         private_key_pem.as_bytes(),
-    ).await?;
-    storage.write_created_at(chrono::Utc::now()).await?;
+    ).await
+        .context("Failed to write certificates to storage backend")?;
+    info!("Certificates written successfully to storage backend");
+
+    storage.write_created_at(chrono::Utc::now()).await
+        .context("Failed to write created_at timestamp")?;
+    info!("Created_at timestamp written successfully");
 
     Ok(())
 }
@@ -765,8 +1110,21 @@ pub async fn start_http_server(app_config: &crate::config::AppConfig) -> AtomicS
     info!("To stop the program, press Ctrl+C");
 
     // Use the base storage path for serving ACME challenges
-    // Challenges are stored per-domain under https_path/domain/well-known/acme-challenge/
+    // Challenges are stored in a shared location: https_path/well-known/acme-challenge/
     let base_static_path = std::path::PathBuf::from(&app_config.storage.https_path);
+
+    // Build the path to the well-known/acme-challenge directory
+    // Files are stored at: base_path/well-known/acme-challenge/{token}
+    let mut challenge_static_path = base_static_path.clone();
+    challenge_static_path.push("well-known");
+    challenge_static_path.push("acme-challenge");
+
+    // Ensure the challenge directory exists (required for actix_files::Files)
+    // Even when using Redis storage, challenge files are still written to filesystem for HTTP-01
+    tokio::fs::create_dir_all(&challenge_static_path)
+        .await
+        .with_context(|| format!("Failed to create challenge static path directory: {:?}", challenge_static_path))?;
+
     let base_https_path = base_static_path.clone();
     let app_config_data = web::Data::new(app_config.clone());
     let base_path_data = web::Data::new(base_https_path);
@@ -778,10 +1136,11 @@ pub async fn start_http_server(app_config: &crate::config::AppConfig) -> AtomicS
             .app_data(app_config_data.clone())
             .app_data(base_path_data.clone())
             .service(
-                // Serve ACME challenges from the base path
-                // Files are organized as: base_path/domain/well-known/acme-challenge/token
-                actix_files::Files::new("/.well-known/acme-challenge", base_static_path.clone())
-                    .show_files_listing()
+                // Serve ACME challenges from the challenge directory
+                // URL: /.well-known/acme-challenge/{token}
+                // File: base_path/well-known/acme-challenge/{token}
+                // The Files service maps the URL path to the file system path
+                actix_files::Files::new("/.well-known/acme-challenge", challenge_static_path.clone())
                     .prefer_utf8(true),
             )
             .route(
