@@ -153,7 +153,7 @@ ssl-storage --config config.yaml
 
 ### Automated Renewal with Cron
 
-You can set up a cron job to automatically check and renew certificates periodically. The application will automatically check certificate expiration and renew certificates when needed.
+You can set up a cron job to automatically check and renew certificates periodically. The application must be running as a service (see "Running as a Service" below), and the cron job should call the HTTP API endpoint to trigger certificate checks.
 
 #### Example Cron Job
 
@@ -161,7 +161,7 @@ Add the following to your crontab (`crontab -e`) to check and renew certificates
 
 ```bash
 # Check and renew SSL certificates daily at 2 AM
-0 2 * * * /path/to/ssl-storage --config /path/to/config.yaml >> /var/log/ssl-storage.log 2>&1
+0 2 * * * curl -s http://localhost:80/cert/expiration >> /var/log/ssl-storage.log 2>&1
 ```
 
 #### More Frequent Checks
@@ -170,7 +170,7 @@ For more frequent checks (e.g., every 6 hours):
 
 ```bash
 # Check and renew SSL certificates every 6 hours
-0 */6 * * * /path/to/ssl-storage --config /path/to/config.yaml >> /var/log/ssl-storage.log 2>&1
+0 */6 * * * curl -s http://localhost:80/cert/expiration >> /var/log/ssl-storage.log 2>&1
 ```
 
 #### Weekly Check
@@ -179,11 +179,13 @@ For weekly checks (e.g., every Monday at 3 AM):
 
 ```bash
 # Check and renew SSL certificates weekly on Monday at 3 AM
-0 3 * * 1 /path/to/ssl-storage --config /path/to/config.yaml >> /var/log/ssl-storage.log 2>&1
+0 3 * * 1 curl -s http://localhost:80/cert/expiration >> /var/log/ssl-storage.log 2>&1
 ```
 
 #### Notes
 
+- The `ssl-storage` service must be running for the cron job to work
+- Adjust the URL (`http://localhost:80`) to match your server configuration (IP and port from `config.yaml`)
 - The application will automatically check certificate expiration and only renew certificates that are close to expiring
 - If using Redis storage with distributed locking, multiple cron jobs can run simultaneously without conflicts
 
