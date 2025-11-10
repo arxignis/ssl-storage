@@ -41,6 +41,10 @@ pub trait Storage: Send + Sync {
     /// key: The private key
     async fn write_certs(&self, cert: &[u8], chain: &[u8], key: &[u8]) -> Result<()>;
 
+    /// Get the SHA256 hash of the certificate (fullchain + key combined)
+    /// Returns None if certificate doesn't exist
+    async fn get_certificate_hash(&self) -> Result<Option<String>>;
+
     /// Check if certificate exists
     async fn cert_exists(&self) -> bool;
 
@@ -55,6 +59,23 @@ pub trait Storage: Send + Sync {
 
     /// Write DNS challenge code for ACME DNS-01 challenge
     async fn write_dns_challenge(&self, domain: &str, dns_record: &str, dns_value: &str) -> Result<()>;
+
+    /// Get the timestamp when a challenge was created
+    /// Returns None if challenge doesn't exist or has no timestamp
+    async fn get_challenge_timestamp(&self, token: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>>;
+
+    /// Get the timestamp when a DNS challenge was created
+    /// Returns None if challenge doesn't exist or has no timestamp
+    async fn get_dns_challenge_timestamp(&self, domain: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>>;
+
+    /// Check if a challenge is expired based on TTL
+    async fn is_challenge_expired(&self, token: &str, max_ttl_seconds: u64) -> Result<bool>;
+
+    /// Check if a DNS challenge is expired based on TTL
+    async fn is_dns_challenge_expired(&self, domain: &str, max_ttl_seconds: u64) -> Result<bool>;
+
+    /// Clean up expired challenges
+    async fn cleanup_expired_challenges(&self, max_ttl_seconds: u64) -> Result<()>;
 
     /// Get the path for static files (well-known directory)
     fn static_path(&self) -> PathBuf;
@@ -77,6 +98,19 @@ pub trait Storage: Send + Sync {
 
     /// Write ACME account credentials to storage
     async fn write_account_credentials(&self, credentials: &str) -> Result<()>;
+
+    /// Record a certificate generation failure
+    async fn record_failure(&self, error: &str) -> Result<()>;
+
+    /// Get the last failure timestamp and error message
+    /// Returns None if no failure was recorded
+    async fn get_last_failure(&self) -> Result<Option<(chrono::DateTime<chrono::Utc>, String)>>;
+
+    /// Clear failure record (called when certificate is successfully generated)
+    async fn clear_failure(&self) -> Result<()>;
+
+    /// Get the number of consecutive failures
+    async fn get_failure_count(&self) -> Result<u32>;
 }
 
 /// Factory for creating storage backends

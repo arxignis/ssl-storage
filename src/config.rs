@@ -25,6 +25,7 @@ pub struct ConfigOpts {
     pub redis_url: Option<String>,
     pub lock_ttl_seconds: Option<u64>,
     pub redis_ssl: Option<RedisSslConfig>,
+    pub challenge_max_ttl_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +130,16 @@ pub struct AcmeConfig {
     pub development: bool,
     #[serde(default = "default_dns_lookup_config")]
     pub dns_lookup: DnsLookupConfig,
+    #[serde(default = "default_retry_config")]
+    pub retry: RetryConfig,
+    /// Maximum TTL in seconds for ACME challenges (default: 3600 = 1 hour)
+    /// Challenges older than this will be considered expired and regenerated
+    #[serde(default = "default_challenge_max_ttl_seconds")]
+    pub challenge_max_ttl_seconds: u64,
+}
+
+fn default_challenge_max_ttl_seconds() -> u64 {
+    3600 // 1 hour - ACME challenges are typically valid for a limited time
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -152,6 +163,55 @@ fn default_max_attempts() -> u32 {
 
 fn default_delay_seconds() -> u64 {
     10
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryConfig {
+    /// Enable periodic rechecking of failed certificates
+    #[serde(default = "default_enable_periodic_check")]
+    pub enable_periodic_check: bool,
+    /// Interval in seconds between periodic checks (default: 3600 = 1 hour)
+    #[serde(default = "default_check_interval_seconds")]
+    pub check_interval_seconds: u64,
+    /// Minimum delay in seconds before retrying a failed certificate (default: 300 = 5 minutes)
+    #[serde(default = "default_min_retry_delay_seconds")]
+    pub min_retry_delay_seconds: u64,
+    /// Maximum delay in seconds before retrying a failed certificate (default: 86400 = 24 hours)
+    #[serde(default = "default_max_retry_delay_seconds")]
+    pub max_retry_delay_seconds: u64,
+    /// Maximum number of retries before giving up (0 = unlimited, default: 0)
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+}
+
+fn default_retry_config() -> RetryConfig {
+    RetryConfig {
+        enable_periodic_check: default_enable_periodic_check(),
+        check_interval_seconds: default_check_interval_seconds(),
+        min_retry_delay_seconds: default_min_retry_delay_seconds(),
+        max_retry_delay_seconds: default_max_retry_delay_seconds(),
+        max_retries: default_max_retries(),
+    }
+}
+
+fn default_enable_periodic_check() -> bool {
+    true
+}
+
+fn default_check_interval_seconds() -> u64 {
+    3600 // 1 hour
+}
+
+fn default_min_retry_delay_seconds() -> u64 {
+    300 // 5 minutes
+}
+
+fn default_max_retry_delay_seconds() -> u64 {
+    86400 // 24 hours
+}
+
+fn default_max_retries() -> u32 {
+    0 // unlimited
 }
 
 impl AppConfig {
@@ -194,6 +254,7 @@ impl AppConfig {
                 redis_url: self.storage.redis_url.clone(),
                 lock_ttl_seconds: Some(self.storage.lock_ttl_seconds),
                 redis_ssl: self.storage.redis_ssl.clone(),
+                challenge_max_ttl_seconds: Some(self.acme.challenge_max_ttl_seconds),
             },
         }
     }

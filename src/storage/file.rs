@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::storage::Storage;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use std::path::PathBuf;
 
@@ -157,6 +157,13 @@ impl Storage for FileStorage {
         let mut fullchain = cert.to_vec();
         fullchain.extend_from_slice(chain);
 
+        // Calculate SHA256 hash of fullchain + key for change detection
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(&fullchain);
+        hasher.update(key);
+        let hash = format!("{:x}", hasher.finalize());
+
         // Write versioned files to archive
         let files = [
             (format!("cert{}.pem", version), cert),
@@ -174,6 +181,12 @@ impl Storage for FileStorage {
 
         // Create symlinks in live directory
         self.create_symlinks(version).await?;
+
+        // Store certificate hash for change detection
+        let hash_path = self.live_dir().join("certificate_hash");
+        tokio::fs::write(&hash_path, &hash)
+            .await
+            .with_context(|| format!("Failed to write certificate hash to {:?}", hash_path))?;
 
         Ok(())
     }
@@ -204,7 +217,14 @@ impl Storage for FileStorage {
     }
 
     async fn write_challenge(&self, token: &str, key_auth: &str) -> Result<()> {
-        let mut well_known_folder = self.static_path.clone();
+        // Write challenge files to a shared location (not per-domain)
+        // This allows the HTTP server to serve them from a single base path
+        // The static_path is per-domain, but we need to write to the parent directory
+        let base_path = self.static_path.parent()
+            .ok_or_else(|| anyhow!("Cannot get parent path from static_path"))?
+            .to_path_buf();
+
+        let mut well_known_folder = base_path.clone();
         well_known_folder.push("well-known");
         tokio::fs::create_dir_all(&well_known_folder)
             .await
@@ -216,10 +236,21 @@ impl Storage for FileStorage {
             .await
             .with_context(|| format!("Failed to create acme-challenge directory {:?}", challenge_path))?;
 
-        challenge_path.push(token);
-        tokio::fs::write(&challenge_path, key_auth)
+        // Write challenge file
+        let mut challenge_file = challenge_path.clone();
+        challenge_file.push(token);
+        tokio::fs::write(&challenge_file, key_auth)
             .await
-            .with_context(|| format!("Failed to write challenge file {:?}", challenge_path))?;
+            .with_context(|| format!("Failed to write challenge file {:?}", challenge_file))?;
+
+        // Write challenge timestamp
+        let timestamp = chrono::Utc::now();
+        let mut timestamp_file = challenge_path.clone();
+        timestamp_file.push(format!("{}.timestamp", token));
+        tokio::fs::write(&timestamp_file, timestamp.to_rfc3339())
+            .await
+            .with_context(|| format!("Failed to write challenge timestamp {:?}", timestamp_file))?;
+
         Ok(())
     }
 
@@ -257,6 +288,14 @@ impl Storage for FileStorage {
             .await
             .with_context(|| format!("Failed to write DNS challenge file {:?}", challenge_file))?;
 
+        // Write DNS challenge timestamp
+        let timestamp = chrono::Utc::now();
+        let mut timestamp_file = dns_challenge_dir.clone();
+        timestamp_file.push(format!("{}.timestamp", domain));
+        tokio::fs::write(&timestamp_file, timestamp.to_rfc3339())
+            .await
+            .with_context(|| format!("Failed to write DNS challenge timestamp {:?}", timestamp_file))?;
+
         Ok(())
     }
 
@@ -286,6 +325,253 @@ impl Storage for FileStorage {
         tokio::fs::write(&creds_path, credentials)
             .await
             .with_context(|| format!("Failed to write account credentials to {:?}", creds_path))?;
+
+        Ok(())
+    }
+
+    async fn record_failure(&self, error: &str) -> Result<()> {
+        let failure_path = self.live_dir().join("cert_failure.json");
+        let count_path = self.live_dir().join("cert_failure_count");
+
+        // Read current failure count
+        let mut count = 0u32;
+        if count_path.exists() {
+            if let Ok(content) = tokio::fs::read_to_string(&count_path).await {
+                count = content.trim().parse().unwrap_or(0);
+            }
+        }
+
+        // Increment failure count
+        count += 1;
+
+        // Write failure record
+        let failure_data = serde_json::json!({
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "error": error,
+            "count": count,
+        });
+
+        tokio::fs::create_dir_all(failure_path.parent().unwrap())
+            .await
+            .with_context(|| format!("Failed to create parent directory for {:?}", failure_path))?;
+
+        tokio::fs::write(&failure_path, serde_json::to_string_pretty(&failure_data)?)
+            .await
+            .with_context(|| format!("Failed to write failure record to {:?}", failure_path))?;
+
+        // Write failure count
+        tokio::fs::write(&count_path, count.to_string())
+            .await
+            .with_context(|| format!("Failed to write failure count to {:?}", count_path))?;
+
+        Ok(())
+    }
+
+    async fn get_last_failure(&self) -> Result<Option<(chrono::DateTime<chrono::Utc>, String)>> {
+        let failure_path = self.live_dir().join("cert_failure.json");
+
+        if !failure_path.exists() {
+            return Ok(None);
+        }
+
+        let content = tokio::fs::read_to_string(&failure_path)
+            .await
+            .with_context(|| format!("Failed to read failure record from {:?}", failure_path))?;
+
+        let failure_data: serde_json::Value = serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse failure record from {:?}", failure_path))?;
+
+        let timestamp_str = failure_data["timestamp"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing timestamp in failure record"))?;
+        let timestamp = chrono::DateTime::parse_from_rfc3339(timestamp_str)
+            .with_context(|| format!("Failed to parse timestamp: {}", timestamp_str))?
+            .with_timezone(&chrono::Utc);
+
+        let error = failure_data["error"]
+            .as_str()
+            .ok_or_else(|| anyhow!("Missing error in failure record"))?
+            .to_string();
+
+        Ok(Some((timestamp, error)))
+    }
+
+    async fn clear_failure(&self) -> Result<()> {
+        let failure_path = self.live_dir().join("cert_failure.json");
+        let count_path = self.live_dir().join("cert_failure_count");
+
+        if failure_path.exists() {
+            tokio::fs::remove_file(&failure_path).await.ok();
+        }
+
+        if count_path.exists() {
+            tokio::fs::remove_file(&count_path).await.ok();
+        }
+
+        Ok(())
+    }
+
+    async fn get_failure_count(&self) -> Result<u32> {
+        let count_path = self.live_dir().join("cert_failure_count");
+
+        if !count_path.exists() {
+            return Ok(0);
+        }
+
+        let content = tokio::fs::read_to_string(&count_path)
+            .await
+            .with_context(|| format!("Failed to read failure count from {:?}", count_path))?;
+
+        let count = content.trim().parse::<u32>()
+            .with_context(|| format!("Failed to parse failure count: {}", content))?;
+
+        Ok(count)
+    }
+
+    async fn get_certificate_hash(&self) -> Result<Option<String>> {
+        let hash_path = self.live_dir().join("certificate_hash");
+
+        // If hash exists, return it
+        if hash_path.exists() {
+            let content = tokio::fs::read_to_string(&hash_path)
+                .await
+                .with_context(|| format!("Failed to read certificate hash from {:?}", hash_path))?;
+            return Ok(Some(content.trim().to_string()));
+        }
+
+        // Hash doesn't exist, but check if certificate exists
+        if !self.cert_exists().await {
+            return Ok(None);
+        }
+
+        // Certificate exists but hash doesn't - generate it
+        let fullchain = self.read_fullchain().await?;
+        let key = self.read_key().await?;
+
+        // Calculate SHA256 hash of fullchain + key
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(&fullchain);
+        hasher.update(&key);
+        let hash = format!("{:x}", hasher.finalize());
+
+        // Store the hash for future use
+        tokio::fs::write(&hash_path, &hash)
+            .await
+            .with_context(|| format!("Failed to write certificate hash to {:?}", hash_path))?;
+
+        Ok(Some(hash))
+    }
+
+    async fn get_challenge_timestamp(&self, token: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let base_path = self.static_path.parent()
+            .ok_or_else(|| anyhow!("Cannot get parent path from static_path"))?
+            .to_path_buf();
+
+        let mut timestamp_path = base_path.clone();
+        timestamp_path.push("well-known");
+        timestamp_path.push("acme-challenge");
+        timestamp_path.push(format!("{}.timestamp", token));
+
+        if !timestamp_path.exists() {
+            return Ok(None);
+        }
+
+        let content = tokio::fs::read_to_string(&timestamp_path)
+            .await
+            .with_context(|| format!("Failed to read challenge timestamp from {:?}", timestamp_path))?;
+
+        let timestamp = chrono::DateTime::parse_from_rfc3339(content.trim())
+            .with_context(|| format!("Failed to parse challenge timestamp: {}", content))?
+            .with_timezone(&chrono::Utc);
+
+        Ok(Some(timestamp))
+    }
+
+    async fn get_dns_challenge_timestamp(&self, domain: &str) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        let mut timestamp_path = self.base_path.clone();
+        timestamp_path.push(domain);
+        timestamp_path.push("dns-challenges");
+        timestamp_path.push(format!("{}.timestamp", domain));
+
+        if !timestamp_path.exists() {
+            return Ok(None);
+        }
+
+        let content = tokio::fs::read_to_string(&timestamp_path)
+            .await
+            .with_context(|| format!("Failed to read DNS challenge timestamp from {:?}", timestamp_path))?;
+
+        let timestamp = chrono::DateTime::parse_from_rfc3339(content.trim())
+            .with_context(|| format!("Failed to parse DNS challenge timestamp: {}", content))?
+            .with_timezone(&chrono::Utc);
+
+        Ok(Some(timestamp))
+    }
+
+    async fn is_challenge_expired(&self, token: &str, max_ttl_seconds: u64) -> Result<bool> {
+        let timestamp = match self.get_challenge_timestamp(token).await? {
+            Some(ts) => ts,
+            None => return Ok(true), // No timestamp means expired
+        };
+
+        let now = chrono::Utc::now();
+        let age = now - timestamp;
+        let age_seconds = age.num_seconds() as u64;
+
+        Ok(age_seconds >= max_ttl_seconds)
+    }
+
+    async fn is_dns_challenge_expired(&self, domain: &str, max_ttl_seconds: u64) -> Result<bool> {
+        let timestamp = match self.get_dns_challenge_timestamp(domain).await? {
+            Some(ts) => ts,
+            None => return Ok(true), // No timestamp means expired
+        };
+
+        let now = chrono::Utc::now();
+        let age = now - timestamp;
+        let age_seconds = age.num_seconds() as u64;
+
+        Ok(age_seconds >= max_ttl_seconds)
+    }
+
+    async fn cleanup_expired_challenges(&self, max_ttl_seconds: u64) -> Result<()> {
+        let base_path = self.static_path.parent()
+            .ok_or_else(|| anyhow!("Cannot get parent path from static_path"))?
+            .to_path_buf();
+
+        let mut challenge_dir = base_path.clone();
+        challenge_dir.push("well-known");
+        challenge_dir.push("acme-challenge");
+
+        if !challenge_dir.exists() {
+            return Ok(());
+        }
+
+        let mut entries = tokio::fs::read_dir(&challenge_dir).await
+            .with_context(|| format!("Failed to read challenge directory {:?}", challenge_dir))?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+
+            // Skip timestamp files
+            if name.ends_with(".timestamp") {
+                continue;
+            }
+
+            // Check if challenge is expired
+            if let Ok(expired) = self.is_challenge_expired(&name, max_ttl_seconds).await {
+                if expired {
+                    let file_path = entry.path();
+                    let timestamp_path = challenge_dir.join(format!("{}.timestamp", name));
+
+                    // Remove challenge file and timestamp
+                    tokio::fs::remove_file(&file_path).await.ok();
+                    tokio::fs::remove_file(&timestamp_path).await.ok();
+                }
+            }
+        }
 
         Ok(())
     }
