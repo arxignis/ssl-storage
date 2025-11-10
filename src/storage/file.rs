@@ -259,4 +259,34 @@ impl Storage for FileStorage {
 
         Ok(())
     }
+
+    async fn read_account_credentials(&self) -> Result<Option<String>> {
+        let mut creds_path = self.base_path.clone();
+        creds_path.push("acme_account_credentials.json");
+
+        if !creds_path.exists() {
+            return Ok(None);
+        }
+
+        let content = tokio::fs::read_to_string(&creds_path)
+            .await
+            .with_context(|| format!("Failed to read account credentials from {:?}", creds_path))?;
+
+        Ok(Some(content))
+    }
+
+    async fn write_account_credentials(&self, credentials: &str) -> Result<()> {
+        let mut creds_path = self.base_path.clone();
+        creds_path.push("acme_account_credentials.json");
+
+        tokio::fs::create_dir_all(creds_path.parent().unwrap())
+            .await
+            .with_context(|| format!("Failed to create parent directory for {:?}", creds_path))?;
+
+        tokio::fs::write(&creds_path, credentials)
+            .await
+            .with_context(|| format!("Failed to write account credentials to {:?}", creds_path))?;
+
+        Ok(())
+    }
 }

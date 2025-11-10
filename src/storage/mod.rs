@@ -70,6 +70,13 @@ pub trait Storage: Send + Sync {
     fn read_key_sync(&self) -> Option<Result<Vec<u8>>> {
         None
     }
+
+    /// Read ACME account credentials from storage
+    /// Returns None if credentials don't exist
+    async fn read_account_credentials(&self) -> Result<Option<String>>;
+
+    /// Write ACME account credentials to storage
+    async fn write_account_credentials(&self, credentials: &str) -> Result<()>;
 }
 
 /// Factory for creating storage backends

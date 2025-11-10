@@ -371,5 +371,27 @@ impl Storage for RedisStorage {
         tracing::info!("DNS challenge code saved to Redis: {} = {}", dns_record, dns_value);
         Ok(())
     }
+
+    async fn read_account_credentials(&self) -> Result<Option<String>> {
+        let mut conn = self.get_conn().await?;
+        // Use a shared key for account credentials (not per-domain)
+        let creds_key = "ssl-storage:acme:account_credentials";
+
+        let result: Option<String> = conn.get(creds_key).await
+            .with_context(|| format!("Failed to read account credentials from Redis key: {}", creds_key))?;
+
+        Ok(result)
+    }
+
+    async fn write_account_credentials(&self, credentials: &str) -> Result<()> {
+        let mut conn = self.get_conn().await?;
+        // Use a shared key for account credentials (not per-domain)
+        let creds_key = "ssl-storage:acme:account_credentials";
+
+        conn.set::<_, _, ()>(creds_key, credentials).await
+            .with_context(|| format!("Failed to write account credentials to Redis key: {}", creds_key))?;
+
+        Ok(())
+    }
 }
 

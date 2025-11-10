@@ -488,6 +488,42 @@ pub async fn request_cert(config: &crate::config::Config) -> AtomicServerResult<
     request_cert_internal(config).await
 }
 
+/// Helper function to create a new Let's Encrypt account and save credentials
+async fn create_new_account(
+    storage: &Box<dyn Storage>,
+    email: &str,
+    lets_encrypt_url: &str,
+) -> AtomicServerResult<(instant_acme::Account, instant_acme::AccountCredentials)> {
+    info!("Creating new LetsEncrypt account with email {}", email);
+
+    let (account, creds) = instant_acme::Account::builder()
+        .context("Failed to create account builder")?
+        .create(
+            &instant_acme::NewAccount {
+                contact: &[&format!("mailto:{}", email)],
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            },
+            lets_encrypt_url.to_string(),
+            None,
+        )
+        .await
+        .context("Failed to create account")?;
+
+    // Save credentials for future use (store as JSON value for now)
+    if let Ok(creds_json) = serde_json::to_string(&creds) {
+        if let Err(e) = storage.write_account_credentials(&creds_json).await {
+            warn!("Failed to save account credentials to storage: {}. Account will be recreated on next run.", e);
+        } else {
+            info!("Saved LetsEncrypt account credentials to storage");
+        }
+    } else {
+        warn!("Failed to serialize account credentials. Account will be recreated on next run.");
+    }
+
+    Ok((account, creds))
+}
+
 async fn request_cert_internal(config: &crate::config::Config) -> AtomicServerResult<()> {
     use instant_acme::OrderStatus;
 
@@ -525,21 +561,49 @@ async fn request_cert_internal(config: &crate::config::Config) -> AtomicServerRe
             "No email set - required for HTTPS certificate initialization with LetsEncrypt",
         );
 
-    info!("Creating LetsEncrypt account with email {}", email);
+    // Try to load existing account credentials from storage
+    let storage = StorageFactory::create_default(config)?;
+    let existing_creds = storage.read_account_credentials().await
+        .context("Failed to read account credentials from storage")?;
 
-    let (account, _creds) = instant_acme::Account::builder()
-        .context("Failed to create account builder")?
-        .create(
-            &instant_acme::NewAccount {
-                contact: &[&format!("mailto:{}", email)],
-                terms_of_service_agreed: true,
-                only_return_existing: false,
-            },
-            lets_encrypt_url.to_string(),
-            None,
-        )
-        .await
-        .context("Failed to create account")?;
+    // Try to restore account from stored credentials, but fall back to creating new account if it fails
+    let (account, _creds) = match existing_creds {
+        Some(_creds_json) => {
+            // Try to restore account from existing credentials
+            info!("Attempting to restore LetsEncrypt account from stored credentials");
+
+            // Note: instant_acme v0.8 doesn't have Account::from_credentials or Credentials type
+            // For now, we'll try to use only_return_existing: true to reuse an account
+            // If that fails, we'll create a new account
+            match instant_acme::Account::builder()
+                .context("Failed to create account builder")?
+                .create(
+                    &instant_acme::NewAccount {
+                        contact: &[&format!("mailto:{}", email)],
+                        terms_of_service_agreed: true,
+                        only_return_existing: true,
+                    },
+                    lets_encrypt_url.to_string(),
+                    None,
+                )
+                .await
+            {
+                Ok((acc, cr)) => {
+                    info!("Successfully reused existing LetsEncrypt account");
+                    (acc, cr)
+                }
+                Err(e) => {
+                    warn!("Failed to restore account from stored credentials: {}. Creating new account.", e);
+                    // Fall through to create new account
+                    create_new_account(&storage, &email, lets_encrypt_url).await?
+                }
+            }
+        }
+        None => {
+            // No stored credentials, create a new account
+            create_new_account(&storage, &email, lets_encrypt_url).await?
+        }
+    };
 
     // Create the ACME order based on the given domain names.
     // Note that this only needs an `&Account`, so the library will let you
