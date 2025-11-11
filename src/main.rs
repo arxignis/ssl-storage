@@ -50,9 +50,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Give the server a moment to start
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
-    // Create domain reader based on config
-    let domain_reader = DomainReaderFactory::create(&app_config.domains)
-        .map_err(|e| format!("Failed to create domain reader: {}", e))?;
+    // Create domain reader based on config (wrap in Arc to share with periodic task)
+    let domain_reader = Arc::new(
+        DomainReaderFactory::create(&app_config.domains)
+            .map_err(|e| format!("Failed to create domain reader: {}", e))?
+    );
 
     // Read domains from configured source
     let domains = domain_reader.read_domains().await
@@ -110,6 +112,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let app_config_clone = app_config.clone();
         let https_path_clone = https_path.clone();
 
+        // Clone the domain reader Arc to share with periodic task
+        let domain_reader_clone = Arc::clone(&domain_reader);
+
         let periodic_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(check_interval);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -119,16 +124,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 info!("Starting periodic certificate recheck...");
 
-                // Re-read domains in case they've changed
-                let domain_reader = match DomainReaderFactory::create(&app_config_clone.domains) {
-                    Ok(reader) => reader,
-                    Err(e) => {
-                        warn!("Failed to create domain reader during periodic check: {}", e);
-                        continue;
-                    }
-                };
-
-                let domains = match domain_reader.read_domains().await {
+                // Re-read domains using the shared reader (will use cached data if available)
+                let domains = match domain_reader_clone.read_domains().await {
                     Ok(d) => d,
                     Err(e) => {
                         warn!("Failed to read domains during periodic check: {}", e);
